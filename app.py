@@ -62,14 +62,19 @@ def _charts():
         ax.set_ylabel("ATM 30d half-spread (vp)"); ax.set_title("REAL option spread (make-or-break cost)")
         ax.legend(fontsize=8); ax.grid(alpha=.25)
         out["spread"] = _png(fig)
-    e = pd.DataFrame(store.query("SELECT * FROM equity_log ORDER BY ts"))
-    if not e.empty and len(e) > 1:
+    e = pd.DataFrame(store.query("SELECT * FROM equity_pts ORDER BY ts"))
+    if not e.empty and e["ts"].nunique() > 1:
         e["dt"] = pd.to_datetime(e["ts"], unit="s")
         fig, ax = plt.subplots(figsize=(8, 2.7))
-        ax.plot(e["dt"], e["eq_maker"] / 1000, color="#2ca02c", lw=1.8, label="MAKER (post at mid)")
-        ax.plot(e["dt"], e["eq_taker"] / 1000, color="#1f77b4", lw=1.5, label="TAKER (cross spread)")
+        colors = {"taker": "#1f77b4", "maker": "#2ca02c", "chase": "#9467bd"}
+        labels = {"taker": "TAKER (cross)", "maker": "MAKER (post mid, can miss)", "chase": "CHASE (mid→bid)"}
+        for b in ("taker", "maker", "chase"):
+            d = e[e["book"] == b]
+            if not d.empty:
+                ax.plot(d["dt"], d["equity"] / 1000, color=colors[b], lw=1.7, label=labels[b])
         ax.axhline(100, color="k", lw=.6, ls="--")
-        ax.set_ylabel("R$ thousands"); ax.set_title("Paper equity — maker vs taker")
+        ax.set_ylabel("R$ thousands (each book = own R$100k)")
+        ax.set_title("Paper equity — execution styles head-to-head")
         ax.legend(fontsize=8); ax.grid(alpha=.25)
         out["equity"] = _png(fig)
     return out
@@ -80,16 +85,19 @@ def home():
     _ensure()
     st, marks, marked = strategy.snapshot()
     ch = _charts()
-    ms = st["maker_stats"]
-    fillrate = (ms["filled"] / ms["posted"] * 100) if ms["posted"] else 0
+    mst, cst = st["stats"]["maker"], st["stats"]["chase"]
+    mk_fill = (mst["filled"] / mst["posted"] * 100) if mst["posted"] else 0
     trades = store.query("SELECT * FROM trades ORDER BY ts DESC LIMIT 30")
     n_ticks = store.query("SELECT COUNT(*) n FROM ticks")[0]["n"]
+    COLOR = {"taker": "#1f77b4", "maker": "#2ca02c", "chase": "#9467bd"}
+    DESC = {"taker": "cross spread", "maker": "post mid, can miss", "chase": "mid→bid"}
 
-    def card(b, color):
+    def card(b):
         eq = marked[b]; ret = (eq / strategy.BANKROLL0 - 1) * 100  # marked-to-market (live)
         n = len(marks[b])
-        return (f"<div class=card style='border-top:3px solid {color}'><div class=muted>{b.upper()} (marked)</div>"
-                f"<div class=big>R${eq:,.0f}</div><div class=muted>{ret:+.1f}% · {n} open tranches</div></div>")
+        return (f"<div class=card style='border-top:3px solid {COLOR[b]}'>"
+                f"<div class=muted>{b.upper()} <span style='font-weight:400'>· {DESC[b]}</span></div>"
+                f"<div class=big>R${eq:,.0f}</div><div class=muted>{ret:+.1f}% · {n} tranches · own R$100k</div></div>")
 
     def trow(r):
         tm = time.strftime("%m-%d %H:%M", time.gmtime(r["ts"]))
@@ -114,20 +122,27 @@ def home():
     .big{{font:600 24px ui-monospace,monospace}}</style></head><body>
     <h1>Vol Risk Premium — Paper Trader <span class=muted>(BTC+ETH short-vol + 1d cashout, laddered)</span></h1>
     <div class=cards>
-      {card("maker", "#2ca02c")}{card("taker", "#1f77b4")}
-      <div class=card><div class=muted>maker fill rate</div><div class=big>{fillrate:.0f}%</div>
-        <div class=muted>{ms['filled']}/{ms['posted']} filled · {ms['expired']} missed</div></div>
+      {card("taker")}{card("maker")}{card("chase")}
+    </div>
+    <div class=cards>
+      <div class=card><div class=muted>MAKER fills</div><div class=big>{mk_fill:.0f}%</div>
+        <div class=muted>{mst['filled']}/{mst['posted']} filled · {mst['expired']} missed</div></div>
+      <div class=card><div class=muted>CHASE fills</div>
+        <div class=big>{cst['filled']}+{cst['crossed']}</div>
+        <div class=muted>{cst['filled']} at mid · {cst['crossed']} crossed to bid · {cst['posted']} posted</div></div>
       <div class=card><div class=muted>sizing · ticks</div><div class=big>f={strategy.F}</div>
         <div class=muted>{n_ticks} ticks · every {POLL_SECONDS//60}min</div></div>
     </div>
     <h2>The spread monitor</h2>{spread}
     <h2>Maker vs taker — paper equity</h2>{equity}
-    <p class=muted>TAKER crosses the spread (sells at bid). MAKER posts at mid and waits —
-    a fill is detected only when a <b>real buy trade prints through the level on Deribit's
-    trade tape</b> (public, tick-accurate, no aliasing on wicks; no assumed fill prob). If
-    no buyer lifts it within {strategy.FILL_WINDOW_DAYS}d the order expires (missed entry).
-    Both ladder {strategy.K_TRANCHES} tranches/sleeve (~{strategy.STAGGER_DAYS:.0f}d apart)
-    and exit as takers on cashout.</p>
+    <p class=muted><b>Three independent books, each on its own R$100k.</b> TAKER crosses
+    the spread (sells at bid, always fills). MAKER posts at mid and waits — fills only when
+    a <b>real buy trade prints through the level on Deribit's tape</b> (tick-accurate, no
+    aliasing, no assumed prob); if no buyer in {strategy.FILL_WINDOW_DAYS}d it EXPIRES
+    (missed). CHASE posts at mid too, but if unfilled by {strategy.CHASE_DEADLINE_DAYS}d it
+    CROSSES to the bid (taker) — never misses, capped at taker cost. All ladder
+    {strategy.K_TRANCHES} tranches/sleeve (~{strategy.STAGGER_DAYS:.0f}d apart), exit as
+    takers on cashout.</p>
     <h2>Trade log</h2><table><tr><th>time UTC</th><th>asset</th><th>action</th><th>strike IV</th>
       <th>days</th><th>ROR</th><th>P&amp;L</th><th>note</th></tr>{trade_rows}</table>
     <p class=muted>Paper · variance-swap convention with live measured spread · fixed Deribit fees ·

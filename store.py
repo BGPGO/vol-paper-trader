@@ -24,13 +24,14 @@ def init():
             ts INTEGER, asset TEXT, action TEXT, days_held REAL, strike_iv REAL,
             rv_ann REAL, ror REAL, cost_ror REAL, pnl_r REAL, note TEXT)""")
         c.execute("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)")
-        c.execute("""CREATE TABLE IF NOT EXISTS equity_log(
-            ts INTEGER, eq_taker REAL, eq_maker REAL)""")
+        c.execute("CREATE TABLE IF NOT EXISTS equity_pts(ts INTEGER, book TEXT, equity REAL)")
 
 
-def log_equity(eq_taker, eq_maker):
+def log_equity(books):  # books: {book_name: equity}
+    ts = int(time.time())
     with _conn() as c:
-        c.execute("INSERT INTO equity_log VALUES(?,?,?)", (int(time.time()), eq_taker, eq_maker))
+        c.executemany("INSERT INTO equity_pts VALUES(?,?,?)",
+                      [(ts, b, e) for b, e in books.items()])
 
 
 def add_tick(asset, d):

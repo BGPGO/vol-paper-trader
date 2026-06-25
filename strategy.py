@@ -1,21 +1,18 @@
-"""Paper-trade engine — two books in parallel + laddered entries.
+"""Paper-trade engine — THREE independent books, each on its own R$100k bankroll
+(NOT split), running the same laddered short-vol BTC+ETH + 1d-cashout strategy. They
+differ only in how ENTRIES execute, to compare execution styles head-to-head:
 
-Goal: measure the REAL option spread AND test whether being a MAKER (post at mid and
-wait) beats being a TAKER (cross the spread). Both books run the same laddered short-vol
-BTC+ETH + 1d-cashout strategy on R$100k at the chosen leverage; the ONLY difference is
-how entries fill:
+  TAKER  — crosses the spread, fills immediately at the bid (pays the half-spread).
+  MAKER  — posts a sell at the mid and waits. Fills only when a real BUY trade prints
+           through the level on Deribit's tape (measured, no aliasing). If no buyer in
+           FILL_WINDOW days, the order EXPIRES (missed entry — flat that tranche).
+  CHASE  — posts at the mid like MAKER, but if unfilled by CHASE_DEADLINE days it CROSSES
+           to the bid (taker) — guaranteed fill, capped at the taker cost. Best of both:
+           captures the spread when a buyer comes, never gets left out.
 
-  TAKER  — fills immediately at the bid (sells vol cheap; pays the half-spread).
-  MAKER  — posts a sell at the mid and waits. Fills when the market trades THROUGH the
-           level (mark_iv rises to the post — measured, this is the adverse-selection
-           channel) OR via uninformed flow at an assumed daily probability. If neither
-           within the fill window, the order EXPIRES (missed entry — flat that tranche).
-
-Exits are taker for both books (a spike-cashout must take liquidity; expiry settles
-free) so the comparison isolates the entry-execution edge. Laddering: each sleeve opens
-a 1/K tranche every ~STAGGER days, so the book is continuous instead of one synchronized
-monthly bet. Fees are fixed; the spread is measured live; the uninformed maker-fill
-probability is the one labeled assumption.
+Exits are taker for all books (a spike-cashout takes liquidity; expiry settles free).
+Ladder: each sleeve opens a 1/K tranche every ~STAGGER days. Fees fixed; spread measured
+live; fills from the real trade tape (no assumed fill probability).
 """
 from __future__ import annotations
 import copy
@@ -28,35 +25,36 @@ import numpy as np
 import deribit
 import store
 
-BANKROLL0 = 100_000.0
-F = 0.43                  # chosen ticket: ~25% DD budget (gross)
+BANKROLL0 = 100_000.0      # PER BOOK (each book gets a full R$100k, independent)
+F = 0.43
 WEIGHT = {"BTC": 0.5, "ETH": 0.5}
 TAU = 30
-K_TRANCHES = 4            # ladder: 4 overlapping tranches per sleeve
-STAGGER_DAYS = TAU / K_TRANCHES   # ~7.5d between tranche entries
-FILL_WINDOW_DAYS = 4      # maker order rests this long before expiring
+K_TRANCHES = 4
+STAGGER_DAYS = TAU / K_TRANCHES
+FILL_WINDOW_DAYS = 4       # MAKER expires (misses) after this
+CHASE_DEADLINE_DAYS = 2    # CHASE crosses to taker after this
 CASHOUT_K = 1.25
 FEE_ROR_RT = 0.008
 FEE_ROR_ONE = 0.004
 YEAR_S = 365 * 24 * 3600
 ASSETS = ["BTC", "ETH"]
-BOOKS = ["taker", "maker"]
+BOOKS = ["taker", "maker", "chase"]
+MAKER_BOOKS = ["maker", "chase"]   # books that post-and-wait
 
-STATE_VERSION = 3  # bump when the state schema changes -> stale state resets cleanly
+STATE_VERSION = 4
 
 DEFAULT_STATE = {
     "_v": STATE_VERSION,
     "books": {b: {"equity": BANKROLL0, "realized": 0.0} for b in BOOKS},
     "tranches": {b: {a: [] for a in ASSETS} for b in BOOKS},
-    "pending_maker": {a: [] for a in ASSETS},
+    "pending": {b: {a: [] for a in ASSETS} for b in MAKER_BOOKS},
+    "stats": {"maker": {"posted": 0, "filled": 0, "expired": 0},
+              "chase": {"posted": 0, "filled": 0, "crossed": 0}},
     "last_px": {}, "last_tranche_day": {}, "last_straddle": {}, "start_ts": None,
-    "maker_stats": {"posted": 0, "filled": 0, "expired": 0},
-    "last_decision_day": None,
 }
 
 
 def _load():
-    """Load state, resetting to a fresh copy if the persisted schema is stale."""
     st = store.get_state(None)
     if not st or st.get("_v") != STATE_VERSION:
         return copy.deepcopy(DEFAULT_STATE)
@@ -76,10 +74,6 @@ def _binance_daily_rv(symbol, days=40):
         return None
 
 
-def _today():
-    return time.strftime("%Y-%m-%d", time.gmtime())
-
-
 def _days(ts):
     return (time.time() - ts) / 86400.0
 
@@ -94,7 +88,6 @@ def poll_and_log():
                  "mark_iv": s["mark_iv"], "bid_iv": s["bid_iv"], "ask_iv": s["ask_iv"],
                  "half_spread_vp": s["half_spread_vp"], "funding8h": deribit.perp_funding(cur)}
             store.add_tick(cur, d); snap[cur] = d
-            # accrue realized variance on every open tranche of this asset (both books)
             last = st["last_px"].get(cur)
             if last:
                 r2 = np.log(d["index_px"] / last) ** 2
@@ -108,13 +101,11 @@ def poll_and_log():
             snap[cur] = {"error": str(e)}
     store.set_state(st)
     dvols = {c: snap[c]["dvol"] for c in ASSETS if c in snap and "dvol" in snap[c]}
-    mk = marked_equity(st, dvols)
-    store.log_equity(mk["taker"], mk["maker"])
+    store.log_equity(marked_equity(st, dvols))
     return snap
 
 
 def marked_equity(st, dvols):
-    """Realized equity + mark-to-market of all open tranches, per book (live curve)."""
     out = {}
     for b in BOOKS:
         eq = st["books"][b]["equity"]
@@ -139,29 +130,28 @@ def _mark_ror(tr, dvol_now):
     return (K - ((t / TAU) * rv2 + ((TAU - t) / TAU) * rem)) / K, np.sqrt(rv2)
 
 
-def _open_tranche(book, cur, strike_iv, equity):
-    return {"entry_ts": time.time(), "strike_iv": strike_iv,
-            "notional": WEIGHT[cur] * F * equity / K_TRANCHES, "sum_r2": 0.0}
+def _tranche(strike_iv, notional, entry_ts=None):
+    return {"entry_ts": entry_ts or time.time(), "strike_iv": strike_iv,
+            "notional": notional, "sum_r2": 0.0}
 
 
 def _close(st, book, cur, tr, tk, cash):
     ror, rv = _mark_ror(tr, tk["dvol"])
     hs = tk["half_spread_vp"] or 0.0
     cost = (2 * hs / max(tr["strike_iv"], 1e-6) + FEE_ROR_RT) if cash else FEE_ROR_ONE
-    net = ror - cost
-    pnl = tr["notional"] * net
+    pnl = tr["notional"] * (ror - cost)
     st["books"][book]["equity"] += pnl
     st["books"][book]["realized"] += pnl
-    store.add_trade(cur, ("CASHOUT" if cash else "SETTLE") + "-" + book, days_held=round(_days(tr["entry_ts"]), 1),
-                    strike_iv=tr["strike_iv"], rv_ann=rv, ror=ror, cost_ror=cost, pnl_r=pnl)
+    store.add_trade(cur, ("CASHOUT" if cash else "SETTLE") + "-" + book,
+                    days_held=round(_days(tr["entry_ts"]), 1), strike_iv=tr["strike_iv"],
+                    rv_ann=rv, ror=ror, cost_ror=cost, pnl_r=pnl)
 
 
 def decide():
-    """Runs EVERY poll: resolve maker fills + cashout/expiry continuously; ladder entry
-    is self-gated by STAGGER_DAYS so it still only adds a tranche ~weekly."""
     st = _load()
     if st["start_ts"] is None:
         st["start_ts"] = time.time()
+    now_ms = time.time() * 1000
 
     for cur in ASSETS:
         rows = store.query("SELECT * FROM ticks WHERE asset=? ORDER BY ts DESC LIMIT 1", (cur,))
@@ -170,42 +160,45 @@ def decide():
         tk = rows[0]
         fc = _binance_daily_rv("BTCUSDT" if cur == "BTC" else "ETHUSDT")
 
-        # ---- resolve pending maker orders via the REAL trade tape (no aliasing, no
-        #      assumed fill prob): fill if a real BUY trade printed through your level ----
-        still = []
-        for od in st["pending_maker"][cur]:
-            tape = deribit.recent_trades(od["call_instrument"], od["post_ts_ms"], time.time() * 1000)
-            through = [t for t in tape if t["direction"] == "buy" and t["iv"] and t["iv"] >= od["call_post_iv_pct"]]
-            if through:
-                vol_through = round(sum(t["amount"] for t in through), 1)
-                st["tranches"]["maker"][cur].append(
-                    {"entry_ts": through[0]["ts"] / 1000.0, "strike_iv": od["post_iv"],
-                     "notional": od["notional"], "sum_r2": 0.0})
-                st["maker_stats"]["filled"] += 1
-                store.add_trade(cur, "FILL-maker", strike_iv=od["post_iv"],
-                                note=f"real buy through level, {vol_through} contracts")
-            elif _days(od["post_ts"]) > FILL_WINDOW_DAYS:
-                st["maker_stats"]["expired"] += 1
-                store.add_trade(cur, "EXPIRE-maker", strike_iv=od["post_iv"], note="no buyer at level")
-            else:
-                still.append(od)
-        st["pending_maker"][cur] = still
+        # ---- resolve pending maker/chase orders via the REAL trade tape ----
+        for b in MAKER_BOOKS:
+            still = []
+            for od in st["pending"][b][cur]:
+                tape = deribit.recent_trades(od["call_instrument"], od["post_ts_ms"], now_ms)
+                through = [t for t in tape if t["direction"] == "buy" and t["iv"] and t["iv"] >= od["call_post_iv_pct"]]
+                if through:
+                    vol_t = round(sum(t["amount"] for t in through), 1)
+                    st["tranches"][b][cur].append(_tranche(od["post_iv"], od["notional"], through[0]["ts"] / 1000.0))
+                    st["stats"][b]["filled"] += 1
+                    store.add_trade(cur, "FILL-" + b, strike_iv=od["post_iv"], note=f"buy through, {vol_t} contr")
+                elif b == "chase" and _days(od["post_ts"]) >= CHASE_DEADLINE_DAYS:
+                    st["tranches"]["chase"][cur].append(_tranche(tk["bid_iv"], od["notional"]))  # cross to bid
+                    st["stats"]["chase"]["crossed"] += 1
+                    store.add_trade(cur, "CROSS-chase", strike_iv=tk["bid_iv"], note="deadline -> taker at bid")
+                elif b == "maker" and _days(od["post_ts"]) > FILL_WINDOW_DAYS:
+                    st["stats"]["maker"]["expired"] += 1
+                    store.add_trade(cur, "EXPIRE-maker", strike_iv=od["post_iv"], note="no buyer at level")
+                else:
+                    still.append(od)
+            st["pending"][b][cur] = still
 
-        # ---- ladder: open a new tranche every STAGGER days ----
+        # ---- ladder: open a new tranche every STAGGER days (each book on its own bank) ----
         lt = st["last_tranche_day"].get(cur)
         ls = st.get("last_straddle", {}).get(cur)
         if (lt is None or _days(lt) >= STAGGER_DAYS) and ls:
-            st["tranches"]["taker"][cur].append(_open_tranche("taker", cur, tk["bid_iv"], st["books"]["taker"]["equity"]))
+            st["tranches"]["taker"][cur].append(
+                _tranche(tk["bid_iv"], WEIGHT[cur] * F * st["books"]["taker"]["equity"] / K_TRANCHES))
             store.add_trade(cur, "ENTER-taker", strike_iv=tk["bid_iv"], note=f"hs={tk['half_spread_vp']:.4f}")
-            st["pending_maker"][cur].append({"post_ts": time.time(), "post_ts_ms": time.time() * 1000,
-                                             "post_iv": tk["mark_iv"], "call_instrument": ls["call_instrument"],
-                                             "call_post_iv_pct": ls["call_mark_iv_pct"],
-                                             "notional": WEIGHT[cur] * F * st["books"]["maker"]["equity"] / K_TRANCHES})
-            st["maker_stats"]["posted"] += 1
-            store.add_trade(cur, "POST-maker", strike_iv=tk["mark_iv"], note=f"resting at mid on {ls['call_instrument']}")
+            for b in MAKER_BOOKS:
+                st["pending"][b][cur].append(
+                    {"post_ts": time.time(), "post_ts_ms": now_ms, "post_iv": tk["mark_iv"],
+                     "call_instrument": ls["call_instrument"], "call_post_iv_pct": ls["call_mark_iv_pct"],
+                     "notional": WEIGHT[cur] * F * st["books"][b]["equity"] / K_TRANCHES})
+                st["stats"][b]["posted"] += 1
+                store.add_trade(cur, "POST-" + b, strike_iv=tk["mark_iv"], note="resting at mid")
             st["last_tranche_day"][cur] = time.time()
 
-        # ---- cashout / expiry on every open tranche (both books) ----
+        # ---- cashout / expiry on every open tranche (all books) ----
         for b in BOOKS:
             keep = []
             for tr in st["tranches"][b][cur]:
