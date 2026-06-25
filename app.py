@@ -78,7 +78,7 @@ def _charts():
 @app.route("/")
 def home():
     _ensure()
-    st, marks = strategy.snapshot()
+    st, marks, marked = strategy.snapshot()
     ch = _charts()
     ms = st["maker_stats"]
     fillrate = (ms["filled"] / ms["posted"] * 100) if ms["posted"] else 0
@@ -86,9 +86,9 @@ def home():
     n_ticks = store.query("SELECT COUNT(*) n FROM ticks")[0]["n"]
 
     def card(b, color):
-        eq = st["books"][b]["equity"]; ret = (eq / strategy.BANKROLL0 - 1) * 100
+        eq = marked[b]; ret = (eq / strategy.BANKROLL0 - 1) * 100  # marked-to-market (live)
         n = len(marks[b])
-        return (f"<div class=card style='border-top:3px solid {color}'><div class=muted>{b.upper()}</div>"
+        return (f"<div class=card style='border-top:3px solid {color}'><div class=muted>{b.upper()} (marked)</div>"
                 f"<div class=big>R${eq:,.0f}</div><div class=muted>{ret:+.1f}% · {n} open tranches</div></div>")
 
     def trow(r):

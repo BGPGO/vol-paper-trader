@@ -107,8 +107,23 @@ def poll_and_log():
         except Exception as e:  # noqa: BLE001
             snap[cur] = {"error": str(e)}
     store.set_state(st)
-    store.log_equity(st["books"]["taker"]["equity"], st["books"]["maker"]["equity"])
+    dvols = {c: snap[c]["dvol"] for c in ASSETS if c in snap and "dvol" in snap[c]}
+    mk = marked_equity(st, dvols)
+    store.log_equity(mk["taker"], mk["maker"])
     return snap
+
+
+def marked_equity(st, dvols):
+    """Realized equity + mark-to-market of all open tranches, per book (live curve)."""
+    out = {}
+    for b in BOOKS:
+        eq = st["books"][b]["equity"]
+        for cur in ASSETS:
+            for tr in st["tranches"][b][cur]:
+                ror, _ = _mark_ror(tr, dvols.get(cur))
+                eq += tr["notional"] * ror
+        out[b] = eq
+    return out
 
 
 def _ann_var(tr):
@@ -142,10 +157,9 @@ def _close(st, book, cur, tr, tk, cash):
 
 
 def decide():
+    """Runs EVERY poll: resolve maker fills + cashout/expiry continuously; ladder entry
+    is self-gated by STAGGER_DAYS so it still only adds a tranche ~weekly."""
     st = _load()
-    today = _today()
-    if st.get("last_decision_day") == today:
-        return st
     if st["start_ts"] is None:
         st["start_ts"] = time.time()
 
@@ -203,20 +217,21 @@ def decide():
                     keep.append(tr)
             st["tranches"][b][cur] = keep
 
-    st["last_decision_day"] = today
     store.set_state(st)
     return st
 
 
 def snapshot():
     st = _load()
+    dvols = {}
+    for cur in ASSETS:
+        t = store.query("SELECT dvol FROM ticks WHERE asset=? ORDER BY ts DESC LIMIT 1", (cur,))
+        dvols[cur] = t[0]["dvol"] if t else None
     marks = {b: [] for b in BOOKS}
     for b in BOOKS:
         for cur in ASSETS:
-            t = store.query("SELECT dvol FROM ticks WHERE asset=? ORDER BY ts DESC LIMIT 1", (cur,))
-            dv = t[0]["dvol"] if t else None
             for tr in st["tranches"][b][cur]:
-                ror, _ = _mark_ror(tr, dv)
+                ror, _ = _mark_ror(tr, dvols.get(cur))
                 marks[b].append({"asset": cur, "days": round(_days(tr["entry_ts"]), 1),
                                  "strike_iv": tr["strike_iv"], "mark_pnl_r": tr["notional"] * ror})
-    return st, marks
+    return st, marks, marked_equity(st, dvols)
