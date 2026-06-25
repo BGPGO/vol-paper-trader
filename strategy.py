@@ -105,7 +105,7 @@ def poll_and_log():
         except Exception as e:  # noqa: BLE001
             snap[cur] = {"error": str(e)}
     store.set_state(st)
-    dvols = {c: snap[c]["dvol"] for c in ALL_ASSETS if c in snap and "dvol" in snap[c]}
+    dvols = {c: snap[c]["mark_iv"] for c in ALL_ASSETS if c in snap and "mark_iv" in snap[c]}
     eq = {}
     for u in UNIVERSES:
         for b, v in marked_equity(st["universes"][u], dvols).items():
@@ -145,7 +145,7 @@ def _tranche(strike_iv, notional, entry_ts=None):
 
 
 def _close(uni, book, cur, tr, tk, cash):
-    ror, rv = _mark_ror(tr, tk["dvol"])
+    ror, rv = _mark_ror(tr, tk["mark_iv"])  # mark ATM-to-ATM, not DVOL
     hs = tk["half_spread_vp"] or 0.0
     cost = (2 * hs / max(tr["strike_iv"], 1e-6) + FEE_ROR_RT) if cash else FEE_ROR_ONE
     pnl = tr["notional"] * (ror - cost)
@@ -226,8 +226,8 @@ def snapshot(universe):
     assets = UNIVERSES[universe]
     dvols = {}
     for cur in assets:
-        t = store.query("SELECT dvol FROM ticks WHERE asset=? ORDER BY ts DESC LIMIT 1", (cur,))
-        dvols[cur] = t[0]["dvol"] if t else None
+        t = store.query("SELECT mark_iv FROM ticks WHERE asset=? ORDER BY ts DESC LIMIT 1", (cur,))
+        dvols[cur] = t[0]["mark_iv"] if t else None
     marks = {b: [] for b in BOOKS}
     for b in BOOKS:
         for cur in assets:
