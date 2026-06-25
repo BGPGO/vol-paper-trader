@@ -14,13 +14,21 @@ import time
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import pandas as pd
 from flask import Flask, Response
+
+
+def _fmt_x(ax):
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    for lb in ax.get_xticklabels():
+        lb.set_rotation(0); lb.set_fontsize(7)
 
 import store
 import strategy
 
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "900"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "300"))
 app = Flask(__name__)
 _started = False
 
@@ -52,7 +60,7 @@ def _png(fig):
 def _charts():
     out = {}
     t = pd.DataFrame(store.query("SELECT * FROM ticks ORDER BY ts"))
-    if not t.empty:
+    if not t.empty and t["ts"].nunique() >= 2:
         t["dt"] = pd.to_datetime(t["ts"], unit="s")
         fig, ax = plt.subplots(figsize=(8, 2.7))
         for cur, c in (("BTC", "#1f77b4"), ("ETH", "#ff7f0e")):
@@ -62,7 +70,7 @@ def _charts():
                         label=f"{cur} now {d['half_spread_vp'].iloc[-1]*100:.2f} / med {d['half_spread_vp'].median()*100:.2f} vp")
         ax.axhline(1.0, color="#d62728", ls="--", lw=1, label="1.0 vp")
         ax.set_ylabel("ATM 30d half-spread (vp)"); ax.set_title("REAL option spread (make-or-break cost)")
-        ax.legend(fontsize=8); ax.grid(alpha=.25)
+        ax.legend(fontsize=8); ax.grid(alpha=.25); _fmt_x(ax)
         out["spread"] = _png(fig)
     e = pd.DataFrame(store.query("SELECT * FROM equity_pts ORDER BY ts"))
     if not e.empty and e["ts"].nunique() > 1:
@@ -77,14 +85,14 @@ def _charts():
         ax.axhline(100, color="k", lw=.6, ls="--")
         ax.set_ylabel("R$ thousands (each book = own R$100k)")
         ax.set_title("Paper equity — execution styles head-to-head")
-        ax.legend(fontsize=8); ax.grid(alpha=.25)
+        ax.legend(fontsize=8); ax.grid(alpha=.25); _fmt_x(ax)
         out["equity"] = _png(fig)
     return out
 
 
 def _book_chart(asset):
     t = pd.DataFrame(store.query("SELECT * FROM ticks WHERE asset=? ORDER BY ts", (asset,)))
-    if t.empty:
+    if t.empty or t["ts"].nunique() < 2:   # need ≥2 points or the band/line can't draw
         return None
     t["dt"] = pd.to_datetime(t["ts"], unit="s")
     fig, ax = plt.subplots(figsize=(8, 2.7))
@@ -104,7 +112,7 @@ def _book_chart(asset):
             if not d.empty:
                 ax.scatter(d["dt"], d["strike_iv"] * 100, marker=mk, c=col, s=40, label=lab, zorder=5)
     ax.set_ylabel("IV (vol %)"); ax.set_title(f"{asset}: book, our order (mid) & fills over time")
-    ax.legend(fontsize=7, ncol=3, loc="upper right"); ax.grid(alpha=.2)
+    ax.legend(fontsize=7, ncol=3, loc="upper right"); ax.grid(alpha=.2); _fmt_x(ax)
     return _png(fig)
 
 
@@ -138,9 +146,9 @@ def home():
     trade_rows = "".join(trow(r) for r in trades) or "<tr><td colspan=8>no trades yet</td></tr>"
     spread = ch.get("spread", "<p class=muted>collecting data…</p>")
     equity = ch.get("equity", "<p class=muted>equity curve builds as cycles complete…</p>")
-    bk = {a: _book_chart(a) for a in strategy.ASSETS}
+    bk = {a: _book_chart(a) for a in strategy.ASSETS}  # already full <img> tags
     books_html = "".join(
-        f'<img src="data:image/png;base64,{bk[a]}"/>' if bk[a] else f"<p class=muted>{a}: collecting…</p>"
+        bk[a] if bk[a] else f"<p class=muted>{a}: collecting… (needs ≥2 ticks)</p>"
         for a in strategy.ASSETS)
     html = f"""<!doctype html><html><head><meta charset=utf-8><title>Vol Paper Trader</title>
     <meta http-equiv=refresh content=300>
