@@ -28,6 +28,7 @@ STAGGER_DAYS = TAU / K_TRANCHES
 FILL_WINDOW_DAYS = 4
 CHASE_DEADLINE_DAYS = 2
 CASHOUT_K = 1.25
+MIN_HOLD_DAYS = 1.0   # backtest (cashout.py) so checa cashout a partir de t=1: min-hold de 1 dia
 FEE_ROR_RT = 0.008
 FEE_ROR_ONE = 0.004
 YEAR_S = 365 * 24 * 3600
@@ -210,7 +211,8 @@ def decide():
             keep = []
             for tr in uni["tranches"][b][cur]:
                 days = _days(tr["entry_ts"])
-                spike = fc is not None and fc > CASHOUT_K * tr["strike_iv"]
+                spike = (fc is not None and days >= MIN_HOLD_DAYS
+                         and fc > CASHOUT_K * tr["strike_iv"])
                 if spike or days >= TAU:
                     _close(uni, b, cur, tr, tk, cash=spike and days < TAU)
                 else:
