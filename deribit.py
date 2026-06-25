@@ -28,14 +28,20 @@ def perp_funding(cur):
     return tk.get("funding_8h")
 
 
-def atm_straddle_iv(cur, target_days=30):
-    """ATM ~30d straddle: returns mark/bid/ask IV (avg of call+put) and half-spread (vol pts)."""
-    idx = index_price(cur)
-    insts = _get("get_instruments", currency=cur, kind="option", expired="false")
+def atm_straddle_iv(underlying, opt_currency=None, target_days=30):
+    """ATM ~30d straddle for any underlying. opt_currency=BTC/ETH (coin-margined) or
+    USDC (linear alts like SOL/XRP/HYPE/AVAX). Returns mark/bid/ask IV, half-spread,
+    call instrument (for the fill tape), and the underlying price."""
+    ccy = opt_currency or underlying
+    insts = _get("get_instruments", currency=ccy, kind="option", expired="false")
+    insts = [i for i in insts if i["instrument_name"].split("_USDC")[0].split("-")[0] == underlying]
+    if not insts:
+        return None
     exps = sorted(set(i["expiration_timestamp"] for i in insts))
     t0 = exps[0]
     expiry = min(exps, key=lambda e: abs((e - t0) / 86400000 - target_days))
     near = [i for i in insts if i["expiration_timestamp"] == expiry]
+    idx = _get("ticker", instrument_name=near[0]["instrument_name"]).get("underlying_price")
     strike = min(set(i["strike"] for i in near), key=lambda k: abs(k - idx))
     out, names = {}, {}
     for opt in ("C", "P"):
@@ -50,7 +56,7 @@ def atm_straddle_iv(cur, target_days=30):
     mark, bid, ask = avg("mark_iv"), avg("bid_iv"), avg("ask_iv")
     half = (ask - bid) / 2.0 if (ask and bid) else None
     days = (expiry - t0) / 86400000
-    return {"strike": strike, "expiry_ms": expiry, "days": round(days, 1),
+    return {"strike": strike, "expiry_ms": expiry, "days": round(days, 1), "underlying_price": idx,
             "mark_iv": mark, "bid_iv": bid, "ask_iv": ask, "half_spread_vp": half,
             "call_instrument": names["C"], "call_mark_iv_pct": out["C"]["mark_iv"]}
 
