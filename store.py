@@ -27,6 +27,20 @@ def init():
         c.execute("CREATE TABLE IF NOT EXISTS equity_pts(ts INTEGER, book TEXT, equity REAL)")
 
 
+def reset_if_epoch(epoch):
+    """Wipe ticks/trades/equity/state if DATA_EPOCH changed — clean restart on demand."""
+    with _conn() as c:
+        row = c.execute("SELECT v FROM kv WHERE k='data_epoch'").fetchone()
+        if row and row["v"] == str(epoch):
+            return False
+        for t in ("ticks", "trades", "equity_pts"):
+            c.execute(f"DELETE FROM {t}")
+        c.execute("DELETE FROM kv WHERE k='state'")
+        c.execute("INSERT INTO kv(k,v) VALUES('data_epoch',?) "
+                  "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(epoch),))
+    return True
+
+
 def log_equity(books):  # books: {book_name: equity}
     ts = int(time.time())
     with _conn() as c:

@@ -38,7 +38,9 @@ def _poller():
 def _ensure():
     global _started
     if not _started:
-        store.init(); _started = True
+        store.init()
+        store.reset_if_epoch(os.environ.get("DATA_EPOCH", "1"))  # clean restart when bumped
+        _started = True
         threading.Thread(target=_poller, daemon=True).start()
 
 
@@ -80,6 +82,32 @@ def _charts():
     return out
 
 
+def _book_chart(asset):
+    t = pd.DataFrame(store.query("SELECT * FROM ticks WHERE asset=? ORDER BY ts", (asset,)))
+    if t.empty:
+        return None
+    t["dt"] = pd.to_datetime(t["ts"], unit="s")
+    fig, ax = plt.subplots(figsize=(8, 2.7))
+    # the book: shaded band between bid and ask IV
+    ax.fill_between(t["dt"], t["bid_iv"] * 100, t["ask_iv"] * 100, color="#9aa7b8", alpha=0.30,
+                    label="book (bid–ask)")
+    ax.plot(t["dt"], t["mark_iv"] * 100, color="#1f4e79", lw=1.0, label="mid (where we post)")
+    # execution events from the trade log
+    ev = pd.DataFrame(store.query(
+        "SELECT * FROM trades WHERE asset=? AND strike_iv IS NOT NULL ORDER BY ts", (asset,)))
+    if not ev.empty:
+        ev["dt"] = pd.to_datetime(ev["ts"], unit="s")
+        styles = {"FILL-maker": ("^", "#2ca02c", "maker fill"), "FILL-chase": ("^", "#9467bd", "chase fill"),
+                  "CROSS-chase": ("x", "#d62728", "chase crossed→bid"), "ENTER-taker": ("v", "#1f77b4", "taker entry")}
+        for act, (mk, col, lab) in styles.items():
+            d = ev[ev["action"] == act]
+            if not d.empty:
+                ax.scatter(d["dt"], d["strike_iv"] * 100, marker=mk, c=col, s=40, label=lab, zorder=5)
+    ax.set_ylabel("IV (vol %)"); ax.set_title(f"{asset}: book, our order (mid) & fills over time")
+    ax.legend(fontsize=7, ncol=3, loc="upper right"); ax.grid(alpha=.2)
+    return _png(fig)
+
+
 @app.route("/")
 def home():
     _ensure()
@@ -110,6 +138,10 @@ def home():
     trade_rows = "".join(trow(r) for r in trades) or "<tr><td colspan=8>no trades yet</td></tr>"
     spread = ch.get("spread", "<p class=muted>collecting data…</p>")
     equity = ch.get("equity", "<p class=muted>equity curve builds as cycles complete…</p>")
+    bk = {a: _book_chart(a) for a in strategy.ASSETS}
+    books_html = "".join(
+        f'<img src="data:image/png;base64,{bk[a]}"/>' if bk[a] else f"<p class=muted>{a}: collecting…</p>"
+        for a in strategy.ASSETS)
     html = f"""<!doctype html><html><head><meta charset=utf-8><title>Vol Paper Trader</title>
     <meta http-equiv=refresh content=300>
     <style>body{{font:14px/1.5 system-ui,sans-serif;max-width:920px;margin:22px auto;padding:0 16px;color:#1a1a1a}}
@@ -134,7 +166,13 @@ def home():
         <div class=muted>{n_ticks} ticks · every {POLL_SECONDS//60}min</div></div>
     </div>
     <h2>The spread monitor</h2>{spread}
-    <h2>Maker vs taker — paper equity</h2>{equity}
+    <h2>Order book over time — where our order sits vs the market</h2>
+    <p class=muted>Shaded band = the live bid–ask of the ATM straddle (the book). The line
+    is the mid, where MAKER/CHASE rest their offers. Markers show actual fills: maker/chase
+    fills (▲), chase crossing to the bid (✕), taker entries (▼) — so you see whether the
+    market came to our resting order or we had to cross.</p>
+    {books_html}
+    <h2>Execution styles — paper equity</h2>{equity}
     <p class=muted><b>Three independent books, each on its own R$100k.</b> TAKER crosses
     the spread (sells at bid, always fills). MAKER posts at mid and waits — fills only when
     a <b>real buy trade prints through the level on Deribit's tape</b> (tick-accurate, no
