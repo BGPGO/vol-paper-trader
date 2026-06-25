@@ -95,24 +95,46 @@ def _book_chart(asset):
     if t.empty or t["ts"].nunique() < 2:   # need ≥2 points or the band/line can't draw
         return None
     t["dt"] = pd.to_datetime(t["ts"], unit="s")
-    fig, ax = plt.subplots(figsize=(8, 2.7))
-    # the book: shaded band between bid and ask IV
-    ax.fill_between(t["dt"], t["bid_iv"] * 100, t["ask_iv"] * 100, color="#9aa7b8", alpha=0.30,
-                    label="book (bid–ask)")
-    ax.plot(t["dt"], t["mark_iv"] * 100, color="#1f4e79", lw=1.0, label="mid (where we post)")
-    # execution events from the trade log
+    t_end = t["dt"].iloc[-1]
+    fig, ax = plt.subplots(figsize=(8, 3.0))
+    # the BOOK: shaded gap between best bid and best ask = the spread (no resting orders here)
+    ax.fill_between(t["dt"], t["bid_iv"] * 100, t["ask_iv"] * 100, color="#9aa7b8", alpha=0.28,
+                    label="bid–ask (spread: vazio)")
+    ax.plot(t["dt"], t["ask_iv"] * 100, color="#9aa7b8", lw=0.6)
+    ax.plot(t["dt"], t["bid_iv"] * 100, color="#9aa7b8", lw=0.6)
+    # the MARKET mid (moves as the market re-quotes) — NOT our order
+    ax.plot(t["dt"], t["mark_iv"] * 100, color="#1f4e79", lw=0.9, ls="--", label="mid do mercado (se mexe)")
+
     ev = pd.DataFrame(store.query(
         "SELECT * FROM trades WHERE asset=? AND strike_iv IS NOT NULL ORDER BY ts", (asset,)))
     if not ev.empty:
         ev["dt"] = pd.to_datetime(ev["ts"], unit="s")
-        styles = {"FILL-maker": ("^", "#2ca02c", "maker fill"), "FILL-chase": ("^", "#9467bd", "chase fill"),
-                  "CROSS-chase": ("x", "#d62728", "chase crossed→bid"), "ENTER-taker": ("v", "#1f77b4", "taker entry")}
+        # OUR resting orders: a FIXED horizontal segment at the posted price, from post-time
+        # until it filled / expired / crossed (or to now if still resting).
+        for book, col in (("maker", "#2ca02c"), ("chase", "#9467bd")):
+            resol = {f"FILL-{book}", "EXPIRE-maker" if book == "maker" else "CROSS-chase"}
+            open_posts, first = [], True
+            for _, r in ev.iterrows():
+                if r["action"] == f"POST-{book}":
+                    open_posts.append((r["dt"], r["strike_iv"]))
+                elif r["action"] in resol and open_posts:
+                    pdt, pk = open_posts.pop(0)
+                    ax.hlines(pk * 100, pdt, r["dt"], color=col, lw=2.4, alpha=.8,
+                              label=f"ordem {book} (parada)" if first else None); first = False
+            for pdt, pk in open_posts:  # still resting -> dotted to now
+                ax.hlines(pk * 100, pdt, t_end, color=col, lw=2.4, ls=":", alpha=.8,
+                          label=f"ordem {book} (parada)" if first else None); first = False
+        # execution markers (where it actually filled)
+        styles = {"FILL-maker": ("^", "#2ca02c", "fill maker"), "FILL-chase": ("^", "#9467bd", "fill chase"),
+                  "CROSS-chase": ("x", "#d62728", "chase cruzou→bid"), "ENTER-taker": ("v", "#1f77b4", "entrada taker")}
         for act, (mk, col, lab) in styles.items():
             d = ev[ev["action"] == act]
             if not d.empty:
-                ax.scatter(d["dt"], d["strike_iv"] * 100, marker=mk, c=col, s=40, label=lab, zorder=5)
-    ax.set_ylabel("IV (vol %)"); ax.set_title(f"{asset}: book, our order (mid) & fills over time")
-    ax.legend(fontsize=7, ncol=3, loc="upper right"); ax.grid(alpha=.2); _fmt_x(ax)
+                ax.scatter(d["dt"], d["strike_iv"] * 100, marker=mk, c=col, s=45, label=lab, zorder=6)
+    ax.set_ylabel("IV (vol %)")
+    ax.set_title(f"{asset}: book do mercado (banda) vs nossa ordem parada (linha fixa) & execuções")
+    ax.legend(fontsize=6.5, ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.18))
+    ax.grid(alpha=.2); _fmt_x(ax)
     return _png(fig)
 
 
