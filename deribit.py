@@ -37,10 +37,11 @@ def atm_straddle_iv(cur, target_days=30):
     expiry = min(exps, key=lambda e: abs((e - t0) / 86400000 - target_days))
     near = [i for i in insts if i["expiration_timestamp"] == expiry]
     strike = min(set(i["strike"] for i in near), key=lambda k: abs(k - idx))
-    out = {}
+    out, names = {}, {}
     for opt in ("C", "P"):
         nm = next(i["instrument_name"] for i in near if i["strike"] == strike
                   and i["instrument_name"].endswith(opt))
+        names[opt] = nm
         tk = _get("ticker", instrument_name=nm)
         out[opt] = {"bid_iv": tk.get("bid_iv"), "mark_iv": tk.get("mark_iv"), "ask_iv": tk.get("ask_iv")}
     def avg(f):
@@ -50,7 +51,20 @@ def atm_straddle_iv(cur, target_days=30):
     half = (ask - bid) / 2.0 if (ask and bid) else None
     days = (expiry - t0) / 86400000
     return {"strike": strike, "expiry_ms": expiry, "days": round(days, 1),
-            "mark_iv": mark, "bid_iv": bid, "ask_iv": ask, "half_spread_vp": half}
+            "mark_iv": mark, "bid_iv": bid, "ask_iv": ask, "half_spread_vp": half,
+            "call_instrument": names["C"], "call_mark_iv_pct": out["C"]["mark_iv"]}
+
+
+def recent_trades(instrument, start_ms, end_ms):
+    """Real trade prints for an instrument over [start_ms, end_ms] — the fill tape.
+    Each: {ts, iv(pct), direction(buy/sell), amount}. Public, no auth, no aliasing."""
+    try:
+        r = _get("get_last_trades_by_instrument_and_time", instrument_name=instrument,
+                 start_timestamp=int(start_ms), end_timestamp=int(end_ms), count=1000)
+        return [{"ts": t["timestamp"], "iv": t.get("iv"), "direction": t.get("direction"),
+                 "amount": t.get("amount", 0)} for t in r.get("trades", [])]
+    except Exception:
+        return []
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ from flask import Flask, Response
 import store
 import strategy
 
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "3600"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "900"))
 app = Flask(__name__)
 _started = False
 
@@ -123,9 +123,11 @@ def home():
     <h2>The spread monitor</h2>{spread}
     <h2>Maker vs taker — paper equity</h2>{equity}
     <p class=muted>TAKER crosses the spread (sells at bid). MAKER posts at mid and waits —
-    fills when the market trades through (adverse selection, measured) or via uninformed
-    flow (assumed {strategy.P_UNINFORMED_DAILY:.0%}/day). Both ladder {strategy.K_TRANCHES}
-    tranches/sleeve (~{strategy.STAGGER_DAYS:.0f}d apart) and exit as takers on cashout.</p>
+    a fill is detected only when a <b>real buy trade prints through the level on Deribit's
+    trade tape</b> (public, tick-accurate, no aliasing on wicks; no assumed fill prob). If
+    no buyer lifts it within {strategy.FILL_WINDOW_DAYS}d the order expires (missed entry).
+    Both ladder {strategy.K_TRANCHES} tranches/sleeve (~{strategy.STAGGER_DAYS:.0f}d apart)
+    and exit as takers on cashout.</p>
     <h2>Trade log</h2><table><tr><th>time UTC</th><th>asset</th><th>action</th><th>strike IV</th>
       <th>days</th><th>ROR</th><th>P&amp;L</th><th>note</th></tr>{trade_rows}</table>
     <p class=muted>Paper · variance-swap convention with live measured spread · fixed Deribit fees ·

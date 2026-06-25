@@ -20,7 +20,6 @@ probability is the one labeled assumption.
 from __future__ import annotations
 import copy
 import json
-import random
 import time
 import urllib.request
 
@@ -36,7 +35,6 @@ TAU = 30
 K_TRANCHES = 4            # ladder: 4 overlapping tranches per sleeve
 STAGGER_DAYS = TAU / K_TRANCHES   # ~7.5d between tranche entries
 FILL_WINDOW_DAYS = 4      # maker order rests this long before expiring
-P_UNINFORMED_DAILY = 0.5  # ASSUMED daily prob of an uninformed maker fill (key unknown)
 CASHOUT_K = 1.25
 FEE_ROR_RT = 0.008
 FEE_ROR_ONE = 0.004
@@ -44,14 +42,14 @@ YEAR_S = 365 * 24 * 3600
 ASSETS = ["BTC", "ETH"]
 BOOKS = ["taker", "maker"]
 
-STATE_VERSION = 2  # bump when the state schema changes -> stale state resets cleanly
+STATE_VERSION = 3  # bump when the state schema changes -> stale state resets cleanly
 
 DEFAULT_STATE = {
     "_v": STATE_VERSION,
     "books": {b: {"equity": BANKROLL0, "realized": 0.0} for b in BOOKS},
     "tranches": {b: {a: [] for a in ASSETS} for b in BOOKS},
     "pending_maker": {a: [] for a in ASSETS},
-    "last_px": {}, "last_tranche_day": {}, "start_ts": None,
+    "last_px": {}, "last_tranche_day": {}, "last_straddle": {}, "start_ts": None,
     "maker_stats": {"posted": 0, "filled": 0, "expired": 0},
     "last_decision_day": None,
 }
@@ -104,10 +102,8 @@ def poll_and_log():
                     for tr in st["tranches"][b][cur]:
                         tr["sum_r2"] += r2
             st["last_px"][cur] = d["index_px"]
-            # mark a resting maker order "touched" if vol traded strictly THROUGH the post
-            for od in st["pending_maker"].get(cur, []):
-                if d["mark_iv"] and d["mark_iv"] > od["post_iv"]:
-                    od["touched"] = True
+            st.setdefault("last_straddle", {})[cur] = {
+                "call_instrument": s["call_instrument"], "call_mark_iv_pct": s["call_mark_iv_pct"]}
         except Exception as e:  # noqa: BLE001
             snap[cur] = {"error": str(e)}
     store.set_state(st)
@@ -160,33 +156,39 @@ def decide():
         tk = rows[0]
         fc = _binance_daily_rv("BTCUSDT" if cur == "BTC" else "ETHUSDT")
 
-        # ---- resolve pending maker orders FIRST (posted in a prior cycle) ----
+        # ---- resolve pending maker orders via the REAL trade tape (no aliasing, no
+        #      assumed fill prob): fill if a real BUY trade printed through your level ----
         still = []
         for od in st["pending_maker"][cur]:
-            through = od.get("touched", False)                  # vol traded through (measured)
-            uninformed = random.random() < P_UNINFORMED_DAILY    # benign flow (assumed)
-            if through or uninformed:
+            tape = deribit.recent_trades(od["call_instrument"], od["post_ts_ms"], time.time() * 1000)
+            through = [t for t in tape if t["direction"] == "buy" and t["iv"] and t["iv"] >= od["call_post_iv_pct"]]
+            if through:
+                vol_through = round(sum(t["amount"] for t in through), 1)
                 st["tranches"]["maker"][cur].append(
-                    {"entry_ts": time.time(), "strike_iv": od["post_iv"], "notional": od["notional"], "sum_r2": 0.0})
+                    {"entry_ts": through[0]["ts"] / 1000.0, "strike_iv": od["post_iv"],
+                     "notional": od["notional"], "sum_r2": 0.0})
                 st["maker_stats"]["filled"] += 1
                 store.add_trade(cur, "FILL-maker", strike_iv=od["post_iv"],
-                                note="through" if through else "uninformed")
+                                note=f"real buy through level, {vol_through} contracts")
             elif _days(od["post_ts"]) > FILL_WINDOW_DAYS:
                 st["maker_stats"]["expired"] += 1
-                store.add_trade(cur, "EXPIRE-maker", strike_iv=od["post_iv"], note="missed entry")
+                store.add_trade(cur, "EXPIRE-maker", strike_iv=od["post_iv"], note="no buyer at level")
             else:
                 still.append(od)
         st["pending_maker"][cur] = still
 
         # ---- ladder: open a new tranche every STAGGER days ----
         lt = st["last_tranche_day"].get(cur)
-        if lt is None or _days(lt) >= STAGGER_DAYS:
+        ls = st.get("last_straddle", {}).get(cur)
+        if (lt is None or _days(lt) >= STAGGER_DAYS) and ls:
             st["tranches"]["taker"][cur].append(_open_tranche("taker", cur, tk["bid_iv"], st["books"]["taker"]["equity"]))
             store.add_trade(cur, "ENTER-taker", strike_iv=tk["bid_iv"], note=f"hs={tk['half_spread_vp']:.4f}")
-            st["pending_maker"][cur].append({"post_ts": time.time(), "post_iv": tk["mark_iv"], "touched": False,
+            st["pending_maker"][cur].append({"post_ts": time.time(), "post_ts_ms": time.time() * 1000,
+                                             "post_iv": tk["mark_iv"], "call_instrument": ls["call_instrument"],
+                                             "call_post_iv_pct": ls["call_mark_iv_pct"],
                                              "notional": WEIGHT[cur] * F * st["books"]["maker"]["equity"] / K_TRANCHES})
             st["maker_stats"]["posted"] += 1
-            store.add_trade(cur, "POST-maker", strike_iv=tk["mark_iv"], note="resting at mid")
+            store.add_trade(cur, "POST-maker", strike_iv=tk["mark_iv"], note=f"resting at mid on {ls['call_instrument']}")
             st["last_tranche_day"][cur] = time.time()
 
         # ---- cashout / expiry on every open tranche (both books) ----
