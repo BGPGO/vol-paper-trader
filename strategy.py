@@ -23,6 +23,7 @@ import urllib.request
 import numpy as np
 
 import deribit
+import forecast_1d
 import store
 
 BANKROLL0 = 100_000.0      # PER BOOK (each book gets a full R$100k, independent)
@@ -76,6 +77,10 @@ def _binance_daily_rv(symbol, days=40):
 
 def _days(ts):
     return (time.time() - ts) / 86400.0
+
+
+def _today():
+    return time.strftime("%Y-%m-%d", time.gmtime())
 
 
 def poll_and_log():
@@ -158,7 +163,7 @@ def decide():
         if not rows:
             continue
         tk = rows[0]
-        fc = _binance_daily_rv("BTCUSDT" if cur == "BTC" else "ETHUSDT")
+        fc = forecast_1d.predict_next_day_vol("BTCUSDT" if cur == "BTC" else "ETHUSDT", _today())
 
         # ---- resolve pending maker/chase orders via the REAL trade tape ----
         for b in MAKER_BOOKS:

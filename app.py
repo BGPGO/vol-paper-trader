@@ -214,7 +214,7 @@ def home():
     <h2>Trade log</h2><table><tr><th>time UTC</th><th>asset</th><th>action</th><th>strike IV</th>
       <th>days</th><th>ROR</th><th>P&amp;L</th><th>note</th></tr>{trade_rows}</table>
     <p class=muted>Paper · variance-swap convention with live measured spread · fixed Deribit fees ·
-    cashout = HAR-lite 1d vol proxy. Not investment advice.</p></body></html>"""
+    cashout = CatBoost 1d vol forecast (retrained daily). Not investment advice.</p></body></html>"""
     return Response(html, mimetype="text/html")
 
 
