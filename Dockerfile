@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-ENV PYTHONUNBUFFERED=1 DB_PATH=/data/paper.db PORT=5000 POLL_SECONDS=300 MPLCONFIGDIR=/tmp/mpl DATA_EPOCH=4
+ENV PYTHONUNBUFFERED=1 DB_PATH=/data/paper.db PORT=5000 POLL_SECONDS=300 MPLCONFIGDIR=/tmp/mpl DATA_EPOCH=5
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

@@ -24,8 +24,9 @@ import strategy
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "300"))
 app = Flask(__name__)
 _started = False
-COLOR = {"taker": "#1f77b4", "maker": "#2ca02c", "chase": "#9467bd"}
-DESC = {"taker": "cross spread", "maker": "post mid, can miss", "chase": "mid→bid"}
+COLOR = {"taker": "#1f77b4", "maker": "#2ca02c", "half": "#ff7f0e", "chase": "#9467bd"}
+DESC = {"taker": "cross spread", "maker": "post mid, can miss",
+        "half": "post mid-hs/2, can miss", "chase": "mid→bid"}
 ACOLOR = {"BTC": "#1f77b4", "ETH": "#ff7f0e", "SOL": "#2ca02c", "XRP": "#9467bd",
           "HYPE": "#e377c2", "AVAX": "#d62728"}
 
@@ -87,7 +88,8 @@ def _equity_chart(universe):
         return None
     e["dt"] = pd.to_datetime(e["ts"], unit="s")
     fig, ax = plt.subplots(figsize=(8, 2.7))
-    labels = {"taker": "TAKER (cross)", "maker": "MAKER (post mid)", "chase": "CHASE (mid→bid)"}
+    labels = {"taker": "TAKER (cross)", "maker": "MAKER (post mid)",
+              "half": "HALF (mid-hs/2)", "chase": "CHASE (mid→bid)"}
     for b in strategy.BOOKS:
         d = e[e["book"] == f"{universe}:{b}"]
         if not d.empty:
@@ -109,8 +111,8 @@ def _book_chart(asset):
     ev = pd.DataFrame(store.query("SELECT * FROM trades WHERE asset=? AND strike_iv IS NOT NULL ORDER BY ts", (asset,)))
     if not ev.empty:
         ev["dt"] = pd.to_datetime(ev["ts"], unit="s")
-        for book, col in (("maker", "#2ca02c"), ("chase", "#9467bd")):
-            resol = {f"FILL-{book}", "EXPIRE-maker" if book == "maker" else "CROSS-chase"}
+        for book, col in (("maker", "#2ca02c"), ("half", "#ff7f0e"), ("chase", "#9467bd")):
+            resol = {"FILL-chase", "CROSS-chase"} if book == "chase" else {f"FILL-{book}", f"EXPIRE-{book}"}
             open_posts, first = [], True
             for _, r in ev.iterrows():
                 if r["action"] == f"POST-{book}":
@@ -122,7 +124,8 @@ def _book_chart(asset):
             for pdt, pk in open_posts:
                 ax.hlines(pk * 100, pdt, t_end, color=col, lw=2.4, ls=":", alpha=.8,
                           label=f"ordem {book} (parada)" if first else None); first = False
-        styles = {"FILL-maker": ("^", "#2ca02c", "fill maker"), "FILL-chase": ("^", "#9467bd", "fill chase"),
+        styles = {"FILL-maker": ("^", "#2ca02c", "fill maker"), "FILL-half": ("^", "#ff7f0e", "fill half"),
+                  "FILL-chase": ("^", "#9467bd", "fill chase"),
                   "CROSS-chase": ("x", "#d62728", "chase→bid"), "ENTER-taker": ("v", "#1f77b4", "taker")}
         for act, (mk, col, lab) in styles.items():
             d = ev[ev["action"] == act]
@@ -137,8 +140,9 @@ def render(universe):
     _ensure()
     assets = strategy.UNIVERSES[universe]
     uni, marks, marked = strategy.snapshot(universe)
-    mst, cst = uni["stats"]["maker"], uni["stats"]["chase"]
+    mst, hst, cst = uni["stats"]["maker"], uni["stats"]["half"], uni["stats"]["chase"]
     mk_fill = (mst["filled"] / mst["posted"] * 100) if mst["posted"] else 0
+    hf_fill = (hst["filled"] / hst["posted"] * 100) if hst["posted"] else 0
     qs = ",".join(f"'{a}'" for a in assets)
     trades = store.query(f"SELECT * FROM trades WHERE asset IN ({qs}) ORDER BY ts DESC LIMIT 30")
     n_ticks = store.query(f"SELECT COUNT(*) n FROM ticks WHERE asset IN ({qs})")[0]["n"]
@@ -186,8 +190,10 @@ def render(universe):
     {note}
     <div class=cards>{cards}</div>
     <div class=cards>
-      <div class=card><div class=muted>MAKER fills</div><div class=big>{mk_fill:.0f}%</div>
+      <div class=card><div class=muted>MAKER fills (mid)</div><div class=big>{mk_fill:.0f}%</div>
         <div class=muted>{mst['filled']}/{mst['posted']} · {mst['expired']} missed</div></div>
+      <div class=card style='border-top:3px solid #ff7f0e'><div class=muted>HALF fills (mid-hs/2)</div><div class=big>{hf_fill:.0f}%</div>
+        <div class=muted>{hst['filled']}/{hst['posted']} · {hst['expired']} missed</div></div>
       <div class=card><div class=muted>CHASE fills</div><div class=big>{cst['filled']}+{cst['crossed']}</div>
         <div class=muted>{cst['filled']} mid · {cst['crossed']} crossed · {cst['posted']} posted</div></div>
       <div class=card><div class=muted>sizing · ticks</div><div class=big>f={strategy.F}</div>

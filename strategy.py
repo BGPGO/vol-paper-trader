@@ -32,8 +32,8 @@ MIN_HOLD_DAYS = 1.0   # backtest (cashout.py) so checa cashout a partir de t=1: 
 FEE_ROR_RT = 0.008
 FEE_ROR_ONE = 0.004
 YEAR_S = 365 * 24 * 3600
-BOOKS = ["taker", "maker", "chase"]
-MAKER_BOOKS = ["maker", "chase"]
+BOOKS = ["taker", "maker", "half", "chase"]
+MAKER_BOOKS = ["maker", "half", "chase"]   # 'half' posta no mid - hs/2 (mais perto do bid)
 
 UNIVERSES = {"core": ["BTC", "ETH"], "alts": ["SOL", "XRP", "HYPE", "AVAX"]}
 ASSET_CFG = {
@@ -45,7 +45,7 @@ ALL_ASSETS = [a for u in UNIVERSES.values() for a in u]
 ASSET_UNI = {a: u for u, assets in UNIVERSES.items() for a in assets}
 WEIGHT = {a: 1.0 / len(UNIVERSES[ASSET_UNI[a]]) for a in ALL_ASSETS}
 
-STATE_VERSION = 5
+STATE_VERSION = 6
 
 
 def _new_uni():
@@ -53,6 +53,7 @@ def _new_uni():
             "tranches": {b: {a: [] for a in ALL_ASSETS} for b in BOOKS},
             "pending": {b: {a: [] for a in ALL_ASSETS} for b in MAKER_BOOKS},
             "stats": {"maker": {"posted": 0, "filled": 0, "expired": 0},
+                      "half": {"posted": 0, "filled": 0, "expired": 0},
                       "chase": {"posted": 0, "filled": 0, "crossed": 0}},
             "last_tranche_day": {}}
 
@@ -185,9 +186,9 @@ def decide():
                     uni["tranches"]["chase"][cur].append(_tranche(tk["bid_iv"], od["notional"]))
                     uni["stats"]["chase"]["crossed"] += 1
                     store.add_trade(cur, "CROSS-chase", strike_iv=tk["bid_iv"], note="deadline -> bid")
-                elif b == "maker" and _days(od["post_ts"]) > FILL_WINDOW_DAYS:
-                    uni["stats"]["maker"]["expired"] += 1
-                    store.add_trade(cur, "EXPIRE-maker", strike_iv=od["post_iv"], note="no buyer")
+                elif b in ("maker", "half") and _days(od["post_ts"]) > FILL_WINDOW_DAYS:
+                    uni["stats"][b]["expired"] += 1
+                    store.add_trade(cur, "EXPIRE-" + b, strike_iv=od["post_iv"], note="no buyer")
                 else:
                     still.append(od)
             uni["pending"][b][cur] = still
@@ -198,13 +199,18 @@ def decide():
             uni["tranches"]["taker"][cur].append(
                 _tranche(tk["bid_iv"], WEIGHT[cur] * F * uni["books"]["taker"]["equity"] / K_TRANCHES))
             store.add_trade(cur, "ENTER-taker", strike_iv=tk["bid_iv"], note=f"hs={tk['half_spread_vp']:.4f}")
+            hs = tk["half_spread_vp"] or 0.0
             for b in MAKER_BOOKS:
+                off = hs / 2.0 if b == "half" else 0.0   # 'half' oferta no mid - hs/2 (mais perto do bid -> preenche mais)
+                p_iv = tk["mark_iv"] - off
+                c_iv = ls["call_mark_iv_pct"] - off * 100.0
                 uni["pending"][b][cur].append(
-                    {"post_ts": time.time(), "post_ts_ms": now_ms, "post_iv": tk["mark_iv"],
-                     "call_instrument": ls["call_instrument"], "call_post_iv_pct": ls["call_mark_iv_pct"],
+                    {"post_ts": time.time(), "post_ts_ms": now_ms, "post_iv": p_iv,
+                     "call_instrument": ls["call_instrument"], "call_post_iv_pct": c_iv,
                      "notional": WEIGHT[cur] * F * uni["books"][b]["equity"] / K_TRANCHES})
                 uni["stats"][b]["posted"] += 1
-                store.add_trade(cur, "POST-" + b, strike_iv=tk["mark_iv"], note="resting at mid")
+                store.add_trade(cur, "POST-" + b, strike_iv=p_iv,
+                                note="resting at mid-hs/2" if b == "half" else "resting at mid")
             uni["last_tranche_day"][cur] = time.time()
 
         for b in BOOKS:
